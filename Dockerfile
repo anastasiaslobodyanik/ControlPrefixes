@@ -1,5 +1,5 @@
 # Use an NVIDIA CUDA base image
-FROM nvidia/cuda:11.1.1-cudnn8-runtime-ubuntu20.04
+FROM nvidia/cuda:11.1.1-cudnn8-devel-ubuntu20.04
 
 # Set the working directory in the container
 WORKDIR /app
@@ -38,4 +38,9 @@ RUN pip3 install git+https://github.com/jordiclive/transformers.git@controlprefi
 RUN pip3 install torchtext==0.8.0 torch==1.7.1
 
 RUN apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
+
+
 ENV DEBIAN_FRONTEND=
+
+ENTRYPOINT ["tail"]
+CMD ["-f","/dev/null"]
