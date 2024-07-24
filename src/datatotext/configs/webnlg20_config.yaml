@@ -10,7 +10,7 @@ check_val_every_n_epoch: 1
 
 learning_rate: 7e-05
 eval_min_length: 0
-gpus: 1
+#gpus: 4
 eval_beams: 5
 precision: 32
 val_metric: "bleu"
@@ -26,13 +26,23 @@ control_prefixes: True
 T5_preamble: True
 model_name_or_path: "t5-large"
 restart_with_embed: True
-#cache_dir: ""
 
-output_dir: "../output_dir/"
+# 0 - 0.0 done
+# 1 - 0.25 done
+# 2 - 0.5 done
+# 3 - 0.75 done
+# 0 - 1.0 done
+gpu_id: 1
+loss_weight: 0.99
+output_dir: "../metric_results/loss_weight_099/"
+
+
 data_dir: "../../data/webnlg20"
 
-#logger_name: "wandb"
-#wb_project: "
+logger_name: "wandb"
+wb_project: "wg2text-ControlPrefixes"
+
+#skip_train: False
 #wb_name:
 #resume_from_checkpoint:
 #wb_entity: ""

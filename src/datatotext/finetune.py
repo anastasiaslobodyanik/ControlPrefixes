@@ -27,15 +27,14 @@ from utils import (
     eval_meteor,
     eval_meteor_test_webnlg,
     flatten_list,
-    freeze_embeds,
     freeze_params,
     freeze_prefix,
     label_smoothed_nll_loss,
     lmap,
-    pickle_load,
     pickle_save,
     use_task_specific_params,
 )
+from kgtotext_metric import FactCheckingLoss
 
 
 # import wandb
@@ -46,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 class PrefixModule(PrefixTransformer):
     mode = "datatotext"
-    loss_names = ["loss"]
+    loss_names = ["nat_loss", "kgtotext_loss", "total_loss"]
     metric_names = ["sacrebleu"]
     default_val_metric = "bleu"
 
@@ -63,6 +62,7 @@ class PrefixModule(PrefixTransformer):
                     "--sortish_sampler and --max_tokens_per_batch may not be used simultaneously"
                 )
         super().__init__(hparams, num_labels=None, mode=self.mode, **kwargs)
+
         use_task_specific_params(self.model, "datatotext")
         self.metrics_save_path = Path(self.output_dir) / "metrics.json"
         self.hparams_save_path = Path(self.output_dir) / "hparams.pkl"
@@ -162,7 +162,9 @@ class PrefixModule(PrefixTransformer):
             else self.hparams.val_metric
         )
 
-        self.training_acc_across_batches_at_curr_epoch = []
+        self.training_acc_across_batches_at_curr_epoch_total = []
+        self.training_acc_across_batches_at_curr_epoch_nat = []
+        self.training_acc_across_batches_at_curr_epoch_kgtotext = []
 
         self.eval_min_length = self.hparams.eval_min_length
         rank_zero_info(
@@ -176,6 +178,8 @@ class PrefixModule(PrefixTransformer):
             self.seq2seq_model.encoder.embed_tokens.trainable_weight = (
                 self.model.es.trainable_weight
             )
+
+        self.fact_checking_loss = FactCheckingLoss()
 
     def freeze_embeds(self):
         """Freeze token embeddings and positional embeddings for bart, just token embeddings for t5."""
@@ -234,15 +238,25 @@ class PrefixModule(PrefixTransformer):
 
             # assert lm_logits.shape[-1] == self.vocab_size
             # rank_zero_info(lm_logits.shape, tgt_ids.shape, lm_logits.shape[-1] )
-            loss = ce_loss_fct(
+            nat_loss = ce_loss_fct(
                 lm_logits.view(-1, lm_logits.shape[-1]), tgt_ids.view(-1)
             )
         else:
             lprobs = torch.nn.functional.log_softmax(lm_logits, dim=-1)
-            loss, nll_loss = label_smoothed_nll_loss(
+            nat_loss, nll_loss = label_smoothed_nll_loss(
                 lprobs, tgt_ids, self.hparams.label_smoothing, ignore_index=pad_token_id
             )
-        return (loss,)
+
+        output_ids = torch.argmax(lm_logits, -1)
+        kgtotext_loss = self.fact_checking_loss(
+            src_ids,
+            src_mask,
+            output_ids,
+        ) if self.hparams.loss_weight > 0 else torch.tensor(0.0).to(self.device)
+
+        total_loss = (1 - self.hparams.loss_weight) * nat_loss + self.hparams.loss_weight * kgtotext_loss
+
+        return (nat_loss, kgtotext_loss, total_loss)
 
     # def on_after_backward(self):
     #     rank_zero_info('Accumulate')
@@ -261,7 +275,7 @@ class PrefixModule(PrefixTransformer):
                 print(batch["sources"])
 
             # rank_zero_info('Original',self.seq2seq_model.model.encoder.embed_tokens.weight[5:8])
-            print("Trainable", self.seq2seq_model.encoder.embed_tokens.trainable_weight)
+            # print("Trainable", self.seq2seq_model.encoder.embed_tokens.trainable_weight)
             # rank_zero_info("ES",self.model.es.trainable_weight)
             rank_zero_info(f"step {self.step_count}")
         loss_tensors = self._step(batch)
@@ -275,23 +289,36 @@ class PrefixModule(PrefixTransformer):
         logs["src_pad_tok"] = batch["input_ids"].eq(self.pad).sum()
         logs["src_pad_frac"] = batch["input_ids"].eq(self.pad).float().mean()
 
-        self.training_acc_across_batches_at_curr_epoch.append(loss_tensors[0].item())
+        self.training_acc_across_batches_at_curr_epoch_total.append(loss_tensors[-1].item())
+        self.training_acc_across_batches_at_curr_epoch_nat.append(loss_tensors[0].item())
+        self.training_acc_across_batches_at_curr_epoch_kgtotext.append(loss_tensors[1].item())
         self.log_dict(logs)
-        loss = loss_tensors[0]
+        loss = loss_tensors[-1]
         return {"loss": loss}
 
     def on_epoch_end(self):
-        train_acc_mean = np.mean(self.training_acc_across_batches_at_curr_epoch)
+        train_acc_mean = np.mean(self.training_acc_across_batches_at_curr_epoch_total)
         self.log_dict({"train_loss": train_acc_mean})
         rank_zero_info("train_loss = {}".format(train_acc_mean))
+
+        train_acc_mean = np.mean(self.training_acc_across_batches_at_curr_epoch_nat)
+        self.log_dict({"train_nat_loss": train_acc_mean})
+        rank_zero_info("train_nat_loss = {}".format(train_acc_mean))
+
+        train_acc_mean = np.mean(self.training_acc_across_batches_at_curr_epoch_kgtotext)
+        self.log_dict({"train_kgtotext_loss": train_acc_mean})
+        rank_zero_info("train_kgtotext_loss = {}".format(train_acc_mean))
+
         # rank_zero_info('train_PPL = {}'.format(train_acc_mean.exp()))
-        self.training_acc_across_batches_per_epoch = []  # reset for next epoch
+        self.training_acc_across_batches_per_epoch_total = []  # reset for next epoch
+        self.training_acc_across_batches_per_epoch_nat = []  # reset for next epoch
+        self.training_acc_across_batches_per_epoch_kgtotext = []  # reset for next epoch
 
     def validation_step(self, batch, batch_idx) -> Dict:
 
         if self.hparams.hf_checkpoint:
-            print(self.model.es.trainable_weight)
-            print("SEQ", self.seq2seq_model.shared.trainable_weight)
+            # print(self.model.es.trainable_weight)
+            # print("SEQ", self.seq2seq_model.shared.trainable_weight)
             self.model.es.trainable_weight = self.seq2seq_model.shared.trainable_weight
 
             rank_zero_info(f"Prefix_stored_weight {self.model.es.trainable_weight}")
@@ -361,9 +388,9 @@ class PrefixModule(PrefixTransformer):
                 bleu_info = float(bleu_info.split(",")[0].split("BLEU = ")[1])
 
             losses = {
-                k: torch.stack([x[k] for x in outputs]).mean() for k in self.loss_names
+                k: torch.stack([x[k] for x in outputs]).mean().item() for k in self.loss_names
             }
-            loss = losses["loss"]
+            #loss = losses["loss"]
             generative_metrics = {
                 k: np.array([x[k] for x in outputs]).mean()
                 for k in self.metric_names + ["gen_time", "gen_len"]
@@ -377,31 +404,36 @@ class PrefixModule(PrefixTransformer):
                 else losses[self.val_metric]
             )
             self.log("bleu", bleu_info)
-            self.log("VAL_LOSS", loss)
-            metric_tensor: torch.FloatTensor = torch.tensor(metric_val).type_as(loss)
-            generative_metrics.update({k: v.item() for k, v in losses.items()})
-            losses.update(generative_metrics)
+            for name in self.loss_names:
+                self.log(f"VAL_{name}", losses[name])
+            metric_tensor: torch.FloatTensor = torch.tensor(metric_val) #.type_as(losses["nat_loss"])
+            generative_metrics.update(losses)
+            # losses.update(generative_metrics)
             all_metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
             all_metrics["step_count"] = self.step_count
             self.metrics[prefix].append(
                 all_metrics
             )  # callback writes this to self.metrics_save_path
             preds = flatten_list([x["preds"] for x in outputs])
-            if prefix == "val":
-                self.log_dict(
-                    {
-                        "log": all_metrics,
-                        f"{prefix}_loss": loss,
-                        f"{prefix}_{self.val_metric}": metric_tensor,
-                    }
-                )
-            return {
+
+            self.log_dict({
+                "log": all_metrics,
+                #f"{prefix}_loss": loss,
+                f"{prefix}_{self.val_metric}": metric_tensor,
+            })
+            # for loss, name in zip(losses, self.loss_names):
+            #     log_dict[f"{prefix}_{name}"] = losses[name]
+            # self.log_dict(log_dict)
+            logs = {
                 "bleu": bleu_info,
                 "log": all_metrics,
                 "preds": preds,
-                f"{prefix}_loss": loss,
+                # "loss": {f"{prefix}_{name}": loss for name, loss in zip(self.loss_names, losses)},
                 f"{prefix}_{self.val_metric}": metric_tensor,
             }
+            for loss, name in zip(losses, self.loss_names):
+                logs[f"{prefix}_{name}"] = loss
+            return logs
         else:
 
             data_logs = {}
@@ -424,10 +456,10 @@ class PrefixModule(PrefixTransformer):
                     )
 
                 losses = {
-                    k: torch.stack([x[k] for x in output]).mean()
+                    k: torch.stack([x[k] for x in output]).mean().item()
                     for k in self.loss_names
                 }
-                loss = losses["loss"]
+                loss = losses["total_loss"]
                 generative_metrics = {
                     k: np.array([x[k] for x in output]).mean()
                     for k in self.metric_names + ["gen_time", "gen_len"]
@@ -440,11 +472,9 @@ class PrefixModule(PrefixTransformer):
                     if self.val_metric in generative_metrics
                     else losses[self.val_metric]
                 )
-                metric_tensor: torch.FloatTensor = torch.tensor(metric_val).type_as(
-                    loss
-                )
-                generative_metrics.update({k: v.item() for k, v in losses.items()})
-                losses.update(generative_metrics)
+                metric_tensor: torch.FloatTensor = torch.tensor(metric_val)#.type_as(loss)
+                generative_metrics.update(losses)
+                #losses.update(generative_metrics)
                 all_metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
                 all_metrics["step_count"] = self.step_count
                 self.metrics[prefix].append(
@@ -456,12 +486,16 @@ class PrefixModule(PrefixTransformer):
                     {
                         "log" + "_" + dataset_name: all_metrics,
                         "preds" + "_" + dataset_name: preds,
-                        f"{prefix}_loss" + "_" + dataset_name: loss,
+                        # f"{prefix}_loss" + "_" + dataset_name: loss,
                         f"{prefix}_{self.val_metric}"
                         + "_"
                         + dataset_name: metric_tensor,
                     }
                 )
+                for loss, name in zip(losses, self.loss_names):
+                    data_logs.update(
+                        {f"{prefix}_{name}" + "_" + dataset_name: losses[name]}
+                    )
             return data_logs
 
     def calc_generative_metrics(self, preds, target) -> Dict:
@@ -813,6 +847,13 @@ class PrefixModule(PrefixTransformer):
             required=False,
             help="Set to true if working with special tokens, these methods are fixed LM so the embedding matrix is frozen, bar some special tokens, e.g. <H>, <R> , <T>. ImportantIf continuing a checkpoint, ",
         )
+        parser.add_argument(
+            "--loss_weight",
+            type=float,
+            default=.0,
+            required=True,
+            help="The weight of the fact checking loss. Shold be between 0 and 1",
+        )
 
         return parser
 
@@ -858,7 +899,11 @@ def main(args, model=None):
     # if os.path.exists(args.output_dir):
     #     raise ValueError("--Previous Experiment, delete folder if want to overwrite")
 
-    Path(args.output_dir).mkdir(exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+
+    args.output_dir = os.path.join(args.output_dir, timestamp)
+
+    Path(args.output_dir).mkdir(exist_ok=True, parents=True)
 
     if model is None:
         if "datatotext" in args.task_mode:
@@ -882,17 +927,22 @@ def main(args, model=None):
         else:
             id_ = wandb.util.generate_id()
             rank_zero_info(f"ID {id_}")
+        
+
         logger = WandbLogger(
-            id=id_, name=args.wb_name, project=args.wb_project, entity=args.wb_entity
+         # id=id_,
+         name=f"loss_weight_{args.loss_weight}_{timestamp}",
+         project=args.wb_project,
+         entity=args.wb_entity
         )
 
     if args.skip_train:
-        print("ES", model.model.es.trainable_weight)
-        print("Seq", model.seq2seq_model.shared.trainable_weight)
+        # print("ES", model.model.es.trainable_weight)
+        # print("Seq", model.seq2seq_model.shared.trainable_weight)
         model.seq2seq_model.shared.trainable_weight = model.model.es.trainable_weight
         trainer = pl.Trainer(gpus=1, precision=32)
         trainer.test(model)
-        print("ES", model.model.es.trainable_weight)
+        # print("ES", model.model.es.trainable_weight)
         return model
 
     trainer: pl.Trainer = generic_train(

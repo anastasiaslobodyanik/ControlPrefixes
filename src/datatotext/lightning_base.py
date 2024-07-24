@@ -264,7 +264,7 @@ class PrefixTransformer(pl.LightningModule):
     @property
     def total_steps(self) -> int:
         """The number of total training steps that will be run. Used for lr scheduler purposes."""
-        num_devices = max(1, self.hparams.gpus)
+        num_devices = 1 #max(1, self.hparams.gpus)
         if self.hparams.original_batch_size is not None:
             effective_batch_size = (
                 self.hparams.original_batch_size
@@ -315,15 +315,15 @@ class PrefixTransformer(pl.LightningModule):
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any], filepath=None) -> None:
-        rank_zero_info("SEQ", self.seq2seq_model.shared.trainable_weight)
+        # rank_zero_info("SEQ", self.seq2seq_model.shared.trainable_weight)
         self.model.es.trainable_weight = self.seq2seq_model.shared.trainable_weight
-        rank_zero_info("Prefix_stored_weight", self.model.es.trainable_weight)
+        # rank_zero_info("Prefix_stored_weight", self.model.es.trainable_weight)
         save_path = self.output_dir.joinpath("checkpoint-curr_best")
 
         self.model.config.save_step = self.step_count
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
-        rank_zero_info("SAVING TO checkpoint {}".format(save_path))
+        # rank_zero_info("SAVING TO checkpoint {}".format(save_path))
 
     @staticmethod
     def add_model_specific_args(parser, root_dir):
@@ -572,6 +572,7 @@ def add_generic_args(parser, root_dir) -> None:
     parser.add_argument(
         "--seed", type=int, default=101, help="random seed for initialization"
     )
+    parser.add_argument("--gpu_id", type=int, default=0, help="gpu id")
     parser.add_argument(
         "--control_token_DART",
         type=bool,
@@ -614,10 +615,15 @@ def generic_train(
     if early_stopping_callback is not False:
         extra_callbacks.append(early_stopping_callback)
 
-    rank_zero_info("the max number of epochs is {}".format(args.max_epochs))
-    rank_zero_info("early stopping", early_stopping_callback)
-    rank_zero_info("checkpoint_callback", checkpoint_callback)
-    rank_zero_info("logging", logging_callback)
+    # rank_zero_info("the max number of epochs is {}".format(args.max_epochs))
+    # rank_zero_info("early stopping", early_stopping_callback)
+    # rank_zero_info("checkpoint_callback", checkpoint_callback)
+    # rank_zero_info("logging", logging_callback)
+
+    rank_zero_info(f"the max number of epochs is {args.max_epochs}")
+    rank_zero_info(f"early stopping: {early_stopping_callback}")
+    rank_zero_info(f"checkpoint_callback: {checkpoint_callback}")
+    rank_zero_info(f"logging: {logging_callback}")
 
     trainer = pl.Trainer.from_argparse_args(
         args,
@@ -626,6 +632,7 @@ def generic_train(
         callbacks=[logging_callback] + extra_callbacks,
         logger=logger,
         checkpoint_callback=checkpoint_callback,
+        gpus=[args.gpu_id],
     )
 
     print("args.do_Train:", not (args.skip_train))

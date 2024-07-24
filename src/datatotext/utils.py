@@ -195,6 +195,7 @@ class Seq2SeqDataset(AbstractSeq2SeqDataset):
         batch_encoding["ids"] = torch.tensor([x["id"] for x in batch])
         batch_encoding["cats"] = torch.tensor([x["category"] for x in batch])
         batch_encoding["sources"] = torch.tensor([x["source"] for x in batch])
+        batch_encoding["src_texts"] = [x["src_texts"] for x in batch]
 
         return batch_encoding
 
@@ -409,6 +410,8 @@ def eval_meteor_test_webnlg(folder_data, pred_file, dataset):
     print(cmd_string)
     os.system(cmd_string)
 
+    print(open(pred_file.replace("txt", "meteor"), "r").readlines())
+
     meteor_info = open(pred_file.replace("txt", "meteor"), "r").readlines()[-1].strip()
 
     return meteor_info
@@ -569,6 +572,7 @@ def eval_chrf(ref_file, pred_file):
 
 
 def save_json(content, path, indent=4, **json_dump_kwargs):
+    # print(content)
     with open(path, "w") as f:
         json.dump(content, f, indent=indent, **json_dump_kwargs)
 
