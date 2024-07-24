@@ -39,6 +39,7 @@ RUN pip3 install torchtext==0.8.0 torch==1.7.1
 
 RUN apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
 
+RUN git lfs install
 
 ENV DEBIAN_FRONTEND=
 

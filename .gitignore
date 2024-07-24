@@ -165,3 +165,12 @@ cython_debug/
 data/
 src/output_dir/
 utils/
+
+
+# vscode
+.vscode/
+
+# logs
+lightning_logs/
+wandb/
+metric_results/
